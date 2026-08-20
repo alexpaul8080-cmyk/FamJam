@@ -775,6 +775,39 @@
 <script>
 const $=id=>document.getElementById(id);
 
+/* ====== TURN / relay config ======
+   Video/mic between people needs a TURN relay when a direct connection can't form
+   (common on home/mobile/corporate networks). For reliable calls, get a FREE key:
+   1. Sign up at https://dashboard.metered.ca (free, 20GB/month)
+   2. Create an app, copy your API key
+   3. Paste it below as METERED_KEY.
+   Without a key, we try public relays, but they're unreliable — if people can't
+   see each other, this is almost always why. */
+const METERED_KEY=''; // <-- paste your free Metered API key here for reliable calls
+const METERED_APP=''; // <-- your Metered app subdomain, e.g. 'famjam' (from dashboard)
+
+// Fetch live, working ICE servers. Falls back to public STUN/TURN if no key.
+async function getIceServers(){
+  const base=[
+    {urls:'stun:stun.l.google.com:19302'},
+    {urls:'stun:stun1.l.google.com:19302'}
+  ];
+  if(METERED_KEY && METERED_APP){
+    try{
+      const r=await fetch('https://'+METERED_APP+'.metered.live/api/v1/turn/credentials?apiKey='+METERED_KEY);
+      const list=await r.json();
+      if(Array.isArray(list)&&list.length) return base.concat(list);
+    }catch(e){ console.warn('TURN fetch failed, using fallback',e); }
+  }
+  // fallback: public open relay (may be unreliable)
+  return base.concat([
+    {urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},
+    {urls:'turn:openrelay.metered.ca:443',username:'openrelayproject',credential:'openrelayproject'},
+    {urls:'turns:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'}
+  ]);
+}
+
+
 let mode='create', peer=null, myId=null, myName='', roomHost=null, isHost=false, roomPass='', roomCode='';
 let isCompanion=false, micEnabled=true;
 const conns={}; // dataConnections by peerId
@@ -853,14 +886,8 @@ async function start(){
   if(isCompanion){
     document.body.classList.add('companion');
   }
-  const iceServers=[
-    {urls:'stun:stun.l.google.com:19302'},
-    {urls:'stun:stun1.l.google.com:19302'},
-    // Free public TURN fallbacks (relay when direct P2P fails on strict networks)
-    {urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},
-    {urls:'turn:openrelay.metered.ca:443',username:'openrelayproject',credential:'openrelayproject'},
-    {urls:'turn:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'}
-  ];
+  const iceServers=await getIceServers();
+  cachedIce=iceServers;
   const roomId='famjam-'+roomCode;
   // Host claims the room code as its peer ID. Joiners use a random ID and dial the room.
   const myPeerId=(mode==='create')?roomId:'famjam-'+roomCode+'-'+Math.random().toString(36).slice(2,8);
@@ -1082,13 +1109,14 @@ function reconnectToHost(){
     setTimeout(()=>{ if(conns[roomId]){ hideMigrate();migrating=false; updateMemberList(); sys('Reconnected to the new host.'); } },1400);
   }
 }
+let cachedIce=null;
 function currentIce(){
-  return {iceServers:[
+  return {iceServers: cachedIce || [
     {urls:'stun:stun.l.google.com:19302'},
     {urls:'stun:stun1.l.google.com:19302'},
     {urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},
     {urls:'turn:openrelay.metered.ca:443',username:'openrelayproject',credential:'openrelayproject'},
-    {urls:'turn:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'}
+    {urls:'turns:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'}
   ]};
 }
 function showMigrate(txt){ $('migrateTxt').textContent=txt||'Reconnecting…'; $('migrateOverlay').classList.add('on'); }
@@ -1114,11 +1142,20 @@ function unregStream(id){ delete streamReg[id]; rebuildFsCams(); }
 
 function wireCall(call){
   calls[call.peer]=call;
+  let gotStream=false;
   call.on('stream',remote=>{
+    gotStream=true;
     const name=peers[call.peer]?.name||'Guest';
     addTile(call.peer,name,remote,false);
   });
   call.on('close',()=>{const t=$('tile-'+call.peer);if(t)t.remove();unregStream('cam-'+call.peer);});
+  call.on('error',e=>console.warn('call error',e));
+  // if no media arrives within 10s, it's almost certainly a relay/NAT problem
+  setTimeout(()=>{
+    if(!gotStream && !$('tile-'+call.peer)){
+      sys('⚠️ Could not connect video with '+(peers[call.peer]?.name||'a viewer')+'. This is usually a network relay issue — see the TURN note if it keeps happening.');
+    }
+  },10000);
 }
 function wireScreenCall(call){
   call.on('stream',remote=>{
